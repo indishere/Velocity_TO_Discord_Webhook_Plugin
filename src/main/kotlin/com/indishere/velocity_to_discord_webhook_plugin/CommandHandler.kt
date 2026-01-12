@@ -20,7 +20,7 @@ import kotlin.io.path.div
 class CommandHandler(
     private val server: ProxyServer,
     private val logger: Logger,
-    private val plugin: Init_HQ,
+    private val plugin: InitHQ,
     private val dataDirectory: Path,
     private val getConfig: () -> PluginConfig,
     private val isPluginFolderGood: () -> Boolean,
