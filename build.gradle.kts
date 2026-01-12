@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.indishere"
-version = "0.1-BETA"
+version = "v0.1-BETA"
 
 kotlin {
     jvmToolchain(17)
