@@ -24,7 +24,7 @@ import kotlin.io.path.div
  */
 
 
-class Init_HQ @Inject constructor(
+class InitHQ @Inject constructor(
     val server: ProxyServer,
     val logger: Logger,
     @DataDirectory val dataDirectory: Path
