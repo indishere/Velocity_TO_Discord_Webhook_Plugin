@@ -5,6 +5,7 @@
 .vscode/
 build/
 backup/
+test/
 
 
 # Ignored Files
