@@ -1,0 +1,34 @@
+# config.yml of Velocity to Discord Webhooks Plugin
+
+# TIPS
+# Please DO NOT use TAB key. Instead, use 2 spaces to indent.
+
+plugin:
+  # The Logging mode of the Plugin.
+  # INFO = ONLY all major errors, crashes, etc.
+  # PRODUCTION = All the Major Warnings, Errors and Crashes
+  # FINE = Warnings, Errors, Crashes
+  # DEBUG = EVERYTHING + EXTRA Verbose OUTPUT
+  logging-mode: "PRODUCTION"
+  
+  # This RATE-Limits how many times per minute can players/console send a webhook to prevent abusing webhooks.
+  # Tip: set to 0 to remove the limit (unlimited).
+  ratelimiter:
+    players: 30
+    console: 60
+
+discord:
+  # You can add as many webhook urls as you'd like.
+  # I would recommend naming them based on channels/channels + purpose.
+  # The Format is webhook-name: "full-webhook-url"
+  #                    COPY AND PASTE FROM DISCORD
+  # You can have a global or default webhook by naming it the same. i.e "default" OR "global"
+  webhooks:
+    nothing: "https://discord.com/webhooks/nothing/"
+    # ETC...
+  
+  messages:
+    # You can add as many different custom messages as you want.
+    # The Format is message-name: "message-file-name"
+    # The message files should go into messages/ folder.
+    example1: "example"
