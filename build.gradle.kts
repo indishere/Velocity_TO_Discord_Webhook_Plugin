@@ -1,9 +1,12 @@
+/* Gradle BUILD File @ Velocity to Discord Webhook Plugin */
+
+
 plugins {
-    kotlin("jvm") version "2.0.20"
+    kotlin("jvm") version "2.3.0"
 }
 
 group = "com.indishere"
-version = "v0.1-BETA"
+version = "67KB.v0.1-STABLE"
 
 kotlin {
     jvmToolchain(17)
@@ -18,11 +21,11 @@ dependencies {
     // Velocity API
     compileOnly("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
 
-    // YAML -> Map
+    // YAML Parsing
     implementation("org.yaml:snakeyaml:2.5")
 
-    // Map -> JSON string
-    implementation("tools.jackson.core:jackson-databind:3.0.3")
+    // JSON Parsing
+    implementation("com.google.code.gson:gson:2.13.2")
 }
 
 tasks.processResources {

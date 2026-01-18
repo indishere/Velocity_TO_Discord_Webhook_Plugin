@@ -1,5 +1,13 @@
+# Ignored Directories/Folders
 .kotlin/
 .gradle/
-build/
 .idea/
+.vscode/
+build/
+backup/
+
+
+# Ignored Files
+
 *.iml
+*.jar
