@@ -1,21 +1,29 @@
+/* Initialization HeadQuarters, Velocity to Discord Webhooks Plugin */
+
 package com.indishere.velocity_to_discord_webhook_plugin
 
 
 import com.google.inject.Inject
-import com.velocitypowered.api.event.Subscribe
-import com.velocitypowered.api.event.proxy.ProxyInitializeEvent
-import com.velocitypowered.api.event.proxy.ProxyShutdownEvent
-import com.velocitypowered.api.plugin.annotation.DataDirectory
-import com.velocitypowered.api.proxy.ProxyServer
-import org.slf4j.Logger
-import org.yaml.snakeyaml.LoaderOptions
-import org.yaml.snakeyaml.Yaml
-import org.yaml.snakeyaml.constructor.SafeConstructor
+import java.nio.file.FileSystemAlreadyExistsException
+import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.div
+
+import org.slf4j.Logger
+import com.velocitypowered.api.proxy.ProxyServer
+import com.velocitypowered.api.event.Subscribe
+import com.velocitypowered.api.plugin.annotation.DataDirectory
+import com.velocitypowered.api.event.proxy.ProxyInitializeEvent
+import com.velocitypowered.api.event.proxy.ProxyShutdownEvent
+
+import org.yaml.snakeyaml.LoaderOptions
+import org.yaml.snakeyaml.Yaml
+import org.yaml.snakeyaml.constructor.SafeConstructor
 
 
 /**
@@ -43,22 +51,23 @@ class InitHQ @Inject constructor(
         // SAFE ZONE STARTS HERE
         pluginFolderCheckup()
 
-        if (pluginFolderIsGood) {
-            reloadConfig() // loads from disk (dataDirectory/config.yml)
+        if (pluginFolderIsGood && reloadConfig()) {
             registerCommands()
         } else {
-            logger.error("Plugin folder setup failed. Command registration skipped.")
+            logger.error("Plugin startup aborted: plugin folder or config setup failed. Command registration skipped.")
         }
     }
 
     @Subscribe
     fun onProxyShutdown(@Suppress("UNUSED_PARAMETER") event: ProxyShutdownEvent) {
         shuttingDown = true
-        logger.info("Shutting down Velocity Discord Webhook plugin. Waiting for in-flight webhook requests...")
+        logger.info("Shutting down Velocity Discord Webhook plugin. Cancelling in-flight webhook requests...")
+
+        DiscordWebhook.shutdown()
 
         // Best-effort: wait a short time so in-flight requests can finish.
         try {
-            DiscordWebhook.awaitPending(timeout = 3, unit = TimeUnit.SECONDS)
+            DiscordWebhook.awaitPending(timeout = 1, unit = TimeUnit.SECONDS)
         } catch (e: Exception) {
             logger.warn("Shutdown wait ended with error (continuing shutdown anyway).", e)
         }
@@ -83,17 +92,11 @@ class InitHQ @Inject constructor(
         }
 
         return try {
-            val parsed = loadConfigFile(configFile)
-            configRef.set(parsed)
+            val newConfig = loadConfigFile(configFile)
+            configRef.set(newConfig)
 
             // Don't log webhook URLs. Ever. Not even accidentally.
-            logger.info(
-                "Config loaded. loggingMode={}, webhooks={}, messages={}, hasDefaultOrGlobal={}",
-                parsed.loggingMode,
-                parsed.webhooks.keys.sorted(),
-                parsed.messages.keys.sorted(),
-                parsed.hasDefaultOrGlobalWebhook()
-            )
+            logger.info("Config loaded successfully.")
 
             true
         } catch (e: Exception) {
@@ -103,7 +106,7 @@ class InitHQ @Inject constructor(
     }
 
     private fun loadConfigFile(configFile: Path): PluginConfig {
-        val maxBytes = 1_048_576L // 1MB
+        val maxBytes = 5_242_880L // 5MB Per File
         val size = Files.size(configFile)
         require(size <= maxBytes) { "config.yml too large (${size} bytes). Limit: $maxBytes" }
 
@@ -173,6 +176,59 @@ class InitHQ @Inject constructor(
         )
     }
 
+    // Copies bundled classpath folder "resources/" into dataDirectory, without creating a "resources/" folder on disk.
+    // Does NOT overwrite existing files.
+    private fun copyBundledResourcesIntoPluginDir() {
+        val resourceRoot = "resources"
+
+        val url = javaClass.classLoader.getResource(resourceRoot)
+            ?: javaClass.classLoader.getResource("$resourceRoot/")
+            ?: return
+
+        val uri = url.toURI()
+
+        fun copyTree(fromRoot: Path) {
+            Files.walk(fromRoot).use { stream ->
+                stream.forEach { p ->
+                    if (p == fromRoot) return@forEach
+
+                    val rel = fromRoot.relativize(p).toString()
+                    val out = dataDirectory.resolve(rel)
+
+                    if (Files.isDirectory(p)) {
+                        Files.createDirectories(out)
+                    } else {
+                        if (Files.exists(out)) return@forEach
+                        Files.createDirectories(out.parent)
+                        Files.copy(p, out, StandardCopyOption.REPLACE_EXISTING)
+                    }
+                }
+            }
+        }
+
+        if (uri.scheme == "jar") {
+            var fsCreated: Boolean
+            val fs = try {
+                fsCreated = true
+                FileSystems.newFileSystem(uri, emptyMap<String, Any>())
+            } catch (_: FileSystemAlreadyExistsException) {
+                fsCreated = false
+                FileSystems.getFileSystem(uri)
+            }
+
+            try {
+                val jarRoot = fs.getPath("/$resourceRoot")
+                copyTree(jarRoot)
+            } finally {
+                if (fsCreated) {
+                    fs.close()
+                }
+            }
+        } else {
+            copyTree(Paths.get(uri))
+        }
+    }
+
     fun pluginFolderCheckup() {
         try {
             Files.createDirectories(dataDirectory)
@@ -180,20 +236,18 @@ class InitHQ @Inject constructor(
             val messagesDir = dataDirectory / "messages"
             Files.createDirectories(messagesDir)
 
+            // Copy everything from bundled "resources/" into plugins/<plugin>/ (no "resources/" folder on disk)
+            copyBundledResourcesIntoPluginDir()
+
+            // Hard requirements still enforced (same behavior as before, just sourced via folder-copy now)
             val configFile = dataDirectory / "config.yml"
             if (Files.notExists(configFile)) {
-                javaClass.classLoader
-                    .getResourceAsStream("config.yml")
-                    ?.use { input -> Files.copy(input, configFile) }
-                    ?: error("Missing resource: config.yml")
+                error("Missing resource: config.yml")
             }
 
             val exampleMessage = messagesDir / "example.yml"
             if (Files.notExists(exampleMessage)) {
-                javaClass.classLoader
-                    .getResourceAsStream("messages/example.yml")
-                    ?.use { input -> Files.copy(input, exampleMessage) }
-                    ?: error("Missing resource: messages/example.yml")
+                error("Missing resource: messages/example.yml")
             }
 
             pluginFolderIsGood = true

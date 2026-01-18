@@ -1,20 +1,29 @@
+/* Command Handler @ Velocity to Discord Webhooks Plugin */
+
 package com.indishere.velocity_to_discord_webhook_plugin
 
 
-import com.velocitypowered.api.command.CommandSource
-import com.velocitypowered.api.command.SimpleCommand
-import com.velocitypowered.api.proxy.Player
-import com.velocitypowered.api.proxy.ProxyServer
-import net.kyori.adventure.text.Component
-import org.slf4j.Logger
+import kotlin.io.path.div
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
-import kotlin.io.path.div
+import java.util.concurrent.atomic.AtomicReference
+
+import org.slf4j.Logger
+import net.kyori.adventure.text.Component
+import com.velocitypowered.api.command.CommandSource
+import com.velocitypowered.api.command.SimpleCommand
+import com.velocitypowered.api.proxy.Player
+import com.velocitypowered.api.proxy.ProxyServer
+
+import org.yaml.snakeyaml.LoaderOptions
+import org.yaml.snakeyaml.Yaml
+import org.yaml.snakeyaml.constructor.SafeConstructor
 
 
 class CommandHandler(
@@ -28,8 +37,24 @@ class CommandHandler(
     private val reloadConfig: () -> Boolean
 ) : SimpleCommand {
 
-    // 30/min per player. Console is still rate limited, just way higher.
-    private val rateLimiter = RateLimiter(playerMaxPerMinute = 30, consoleMaxPerMinute = 300)
+    // Config-backed rate limiter (reads plugin.ratelimiter from config.yml)
+    private val rateLimiterProvider = ConfigBackedRateLimiter(
+        dataDirectory = dataDirectory,
+        logger = logger,
+        defaultPlayersPerMinute = 30,
+        defaultConsolePerMinute = 60
+    )
+
+    private data class CachedMessage(
+        val lastModified: Long,
+        val result: YamlToJson.BuildResult,
+        val cachedAt: Long = System.currentTimeMillis()
+    )
+    private data class MessageListCache(val dirMtime: Long, val names: List<String>)
+
+    private val messageCache = ConcurrentHashMap<String, CachedMessage>()
+    private val messageListCache = AtomicReference<MessageListCache?>()
+    private var lastCleanupMs = 0L
 
     override fun execute(invocation: SimpleCommand.Invocation) {
         val source = invocation.source()
@@ -39,7 +64,7 @@ class CommandHandler(
         val verbose = cfg.loggingMode == LoggingMode.DEBUG
 
         if (verbose) {
-            logger.debug("/vdiscord invoked by={} args={}", sourceDebugName(source), sanitizeArgs(args))
+            logger.debug("/vdiscord invoked by={} subcommand={}", sourceDebugName(source), args.getOrNull(0) ?: "<empty>")
         }
 
         val isConsole = source !is Player
@@ -55,7 +80,9 @@ class CommandHandler(
             return
         }
 
-        if (!rateLimiter.tryAcquire(keyFor(source))) {
+        // Rate limit from config.yml (plugin.ratelimiter.players / plugin.ratelimiter.console)
+        val limiter = rateLimiterProvider.current()
+        if (!limiter.tryAcquire(keyFor(source))) {
             DiscordWebhook.Metrics.rateLimitHits.incrementAndGet()
             source.sendMessage(Component.text("Rate limited. Try again in a bit."))
             return
@@ -83,6 +110,10 @@ class CommandHandler(
         }
 
         val ok = reloadConfig()
+        // Also refresh limiter immediately after reload, so you don't wait for file mtime checks.
+        rateLimiterProvider.forceRefresh()
+        clearMessageCaches()
+
         if (ok) {
             source.sendMessage(Component.text("Config reloaded."))
         } else {
@@ -92,7 +123,7 @@ class CommandHandler(
 
     private fun handleSend(source: CommandSource, isConsole: Boolean, args: Array<String>, cfg: PluginConfig) {
         if (args.isEmpty()) {
-            source.sendMessage(Component.text("Usage: /vdiscord send [from <name>] [to <webhook>] <message>"))
+            source.sendMessage(Component.text("Usage: /vdiscord send [from <n>] [to <webhook>] <message>"))
             return
         }
 
@@ -168,35 +199,21 @@ class CommandHandler(
                     return
                 }
 
-                // Permission check on token FIRST (no bypass)
-                val tokenPerm = "vdiscord.send.message.$token"
-                if (!isConsole && !source.hasPermission(tokenPerm)) {
-                    deny(source, tokenPerm)
+                val fileBase = cfg.resolveMessageFileBase(token)
+
+                if (!isSafeKey(fileBase)) {
+                    source.sendMessage(Component.text("Blocked unsafe mapped message id in config.yml: '$token' -> '$fileBase'."))
+                    logger.error("Unsafe message mapping blocked: token={} fileBase={}", token, fileBase)
                     return
                 }
 
-                val fileBase = cfg.resolveMessageFileBase(token)
-
-                // If config maps token -> fileBase, also require permission for the mapped name.
-                if (!fileBase.equals(token, true)) {
-                    if (!isSafeKey(fileBase)) {
-                        source.sendMessage(Component.text("Blocked unsafe mapped message id in config.yml: '$token' -> '$fileBase'."))
-                        logger.error("Unsafe message mapping blocked: token={} fileBase={}", token, fileBase)
-                        return
-                    }
-
-                    val mappedPerm = "vdiscord.send.message.$fileBase"
-                    if (!isConsole && !source.hasPermission(mappedPerm)) {
-                        deny(source, mappedPerm)
-                        return
-                    }
+                val perm = "vdiscord.send.message.$fileBase"
+                if (!isConsole && !source.hasPermission(perm)) {
+                    deny(source, perm)
+                    return
                 }
 
-                val messageFile = resolveMessageFilePathSafely(token, fileBase) ?: return
-                YamlToJson.buildFromMessageFile(
-                    messageFile = messageFile,
-                    usernameOverride = fromName
-                )
+                buildMessageFromFile(token, fileBase, fromName, source) ?: return
             }
         } catch (e: Exception) {
             source.sendMessage(Component.text("Failed to build webhook payload: ${e.message ?: "Unknown error"}"))
@@ -233,7 +250,7 @@ class CommandHandler(
             return
         }
 
-        if (buildResult.json.length > 50_000) {
+        if (buildResult.json.toByteArray(StandardCharsets.UTF_8).size > 50_000) {
             source.sendMessage(Component.text("Message payload too large to send."))
             return
         }
@@ -244,26 +261,34 @@ class CommandHandler(
             .whenComplete { result, err ->
                 if (isShuttingDown()) return@whenComplete
 
+                val playerId = (source as? Player)?.uniqueId
+
                 try {
                     server.scheduler.buildTask(plugin, Runnable {
+                        val currentSource = if (playerId != null) {
+                            server.getPlayer(playerId).orElse(null) ?: return@Runnable
+                        } else {
+                            source
+                        }
+
                         when {
                             err != null -> {
                                 DiscordWebhook.Metrics.webhooksFailed.incrementAndGet()
                                 if (err is TimeoutException) {
-                                    source.sendMessage(Component.text("Webhook request timed out after 30s."))
+                                    currentSource.sendMessage(Component.text("Webhook request timed out after 30s."))
                                 } else {
-                                    source.sendMessage(Component.text("Webhook failed. Check logs."))
+                                    currentSource.sendMessage(Component.text("Webhook failed. Check logs."))
                                 }
                             }
 
                             result.ok -> {
                                 DiscordWebhook.Metrics.webhooksSent.incrementAndGet()
-                                source.sendMessage(Component.text("Sent. (HTTP ${result.status})"))
+                                currentSource.sendMessage(Component.text("Sent. (HTTP ${result.status})"))
                             }
 
                             else -> {
                                 DiscordWebhook.Metrics.webhooksFailed.incrementAndGet()
-                                source.sendMessage(Component.text("Failed. (HTTP ${result.status})"))
+                                currentSource.sendMessage(Component.text("Failed. (HTTP ${result.status})"))
                             }
                         }
                     }).schedule()
@@ -314,8 +339,50 @@ class CommandHandler(
         return messageFileReal
     }
 
+    private fun buildMessageFromFile(
+        token: String,
+        fileBase: String,
+        usernameOverride: String?,
+        source: CommandSource
+    ): YamlToJson.BuildResult? {
+        val now = System.currentTimeMillis()
+        if (now - lastCleanupMs > 300_000) {
+            messageCache.entries.removeIf { (_, v) -> now - v.cachedAt > 3_600_000 }
+            lastCleanupMs = now
+        }
+
+        val messageFile = resolveMessageFilePathSafely(token, fileBase)
+        if (messageFile == null) {
+            source.sendMessage(Component.text("Message '$fileBase' not found or blocked. Check logs."))
+            return null
+        }
+
+        return try {
+            val mtime = Files.getLastModifiedTime(messageFile).toMillis()
+            if (usernameOverride == null) {
+                val cached = messageCache[fileBase]
+                if (cached != null && cached.lastModified == mtime) {
+                    return cached.result
+                }
+            }
+
+            val built = YamlToJson.buildFromMessageFile(
+                messageFile = messageFile,
+                usernameOverride = usernameOverride
+            )
+
+            if (usernameOverride == null) {
+                messageCache[fileBase] = CachedMessage(mtime, built)
+            }
+            built
+        } catch (e: Exception) {
+            logger.error("Failed to build message file '{}': {}", messageFile.fileName, e.message, e)
+            throw e
+        }
+    }
+
     private fun sendUsage(source: CommandSource, cfg: PluginConfig) {
-        source.sendMessage(Component.text("/vdiscord send [from <name>] [to <webhook>] <message>"))
+        source.sendMessage(Component.text("/vdiscord send [from <n>] [to <webhook>] <message>"))
         source.sendMessage(Component.text("/vdiscord reload"))
 
         if (cfg.webhooks.isEmpty()) {
@@ -348,20 +415,31 @@ class CommandHandler(
         // Suggest message IDs (respect perms)
         val messagesDir = dataDirectory / "messages"
         if (Files.exists(messagesDir)) {
-            try {
-                Files.list(messagesDir).use { stream ->
-                    stream
-                        .filter { it.fileName.toString().endsWith(".yml", ignoreCase = true) }
-                        .map { it.fileName.toString().removeSuffix(".yml") }
-                        .forEach { name ->
-                            val perm = "vdiscord.send.message.${name.lowercase(Locale.ROOT)}"
-                            if (isConsole || (source as? CommandSource)?.hasPermission(perm) == true) {
-                                suggestions += name
-                            }
-                        }
+            val names: List<String> = try {
+                val dirMtime = Files.getLastModifiedTime(messagesDir).toMillis()
+                val cached = messageListCache.get()
+                if (cached != null && cached.dirMtime == dirMtime) {
+                    cached.names
+                } else {
+                    val discovered = Files.list(messagesDir).use { stream ->
+                        stream
+                            .filter { it.fileName.toString().endsWith(".yml", ignoreCase = true) }
+                            .map { it.fileName.toString().removeSuffix(".yml") }
+                            .toList()
+                    }
+                    messageListCache.set(MessageListCache(dirMtime, discovered))
+                    discovered
                 }
-            } catch (_: Exception) {
-                // ignore autocomplete failures
+            } catch (e: Exception) {
+                logger.debug("Tab completion failed to list messages", e)
+                emptyList()
+            }
+
+            names.forEach { name ->
+                val perm = "vdiscord.send.message.${name.lowercase(Locale.ROOT)}"
+                if (isConsole || source.hasPermission(perm)) {
+                    suggestions += name
+                }
             }
         }
 
@@ -400,7 +478,6 @@ class CommandHandler(
     }
 
     private fun isSafeKey(s: String): Boolean {
-        // allow dot for namespacing: send.message.example.v1
         return s.matches(Regex("^[a-z0-9._-]{1,64}$"))
     }
 
@@ -408,30 +485,101 @@ class CommandHandler(
         source.sendMessage(Component.text("Missing permission: $perm"))
     }
 
-    private fun keyFor(source: CommandSource): String =
-        (source as? Player)?.uniqueId?.toString() ?: "CONSOLE"
+    private fun keyFor(source: CommandSource): String {
+        return (source as? Player)?.uniqueId?.toString() ?: "CONSOLE"
+    }
 
-    private fun sourceDebugName(source: CommandSource): String =
-        (source as? Player)?.username ?: source.toString()
+    private fun sourceDebugName(source: CommandSource): String {
+        return (source as? Player)?.username ?: source.toString()
+    }
 
-    private fun sanitizeArgs(args: Array<String>): String {
-        // never dump full raw messages to logs
-        val out = ArrayList<String>(args.size)
-        var lastWasFlag = false
-        for ((i, arg) in args.withIndex()) {
-            val lowerPrev = args.getOrNull(i - 1)?.lowercase(Locale.ROOT)
-            val keepFull = lowerPrev in setOf("from", "to")
-            val safe = when {
-                keepFull -> arg
-                arg.length > 50 -> arg.take(50) + "…"
-                arg.startsWith("\"") || arg.startsWith("'") -> "<raw>"
-                lastWasFlag -> arg
-                else -> arg
-            }
-            out += safe
-            lastWasFlag = arg.lowercase(Locale.ROOT) in setOf("from", "to")
+    private fun clearMessageCaches() {
+        messageCache.clear()
+        messageListCache.set(null)
+    }
+
+    // -------------------- config-backed limiter --------------------
+
+    private class ConfigBackedRateLimiter(
+        private val dataDirectory: Path,
+        private val logger: Logger,
+        private val defaultPlayersPerMinute: Int,
+        private val defaultConsolePerMinute: Int
+    ) {
+        @Volatile private var lastMtime: Long = -1L
+        @Volatile private var current: RateLimiter = RateLimiter(defaultPlayersPerMinute, defaultConsolePerMinute)
+
+        fun current(): RateLimiter {
+            refreshIfChanged()
+            return current
         }
-        return out.joinToString(" ")
+
+        fun forceRefresh() {
+            // Force a reload next call
+            lastMtime = -1L
+            refreshIfChanged()
+        }
+
+        private fun refreshIfChanged() {
+            synchronized(this) {
+                val configPath = dataDirectory.resolve("config.yml")
+                if (!Files.exists(configPath)) return
+
+                val mtime = try {
+                    Files.getLastModifiedTime(configPath).toMillis()
+                } catch (_: Exception) {
+                    return
+                }
+
+                if (mtime == lastMtime) return
+                lastMtime = mtime
+
+                val limits = tryReadLimits(configPath) ?: return
+
+                val players = sanitizeLimit(limits.playersPerMinute, defaultPlayersPerMinute)
+                val console = sanitizeLimit(limits.consolePerMinute, defaultConsolePerMinute)
+
+                val old = current.snapshotLimits()
+                if (old.first != players || old.second != console) {
+                    current = RateLimiter(players, console)
+                    logger.info("RateLimiter updated from config.yml: players={} /min, console={} /min", players, console)
+                }
+            }
+        }
+
+        private fun sanitizeLimit(value: Int?, fallback: Int): Int {
+            // value <= 0 means "no limit" (unlimited). We convert to Int.MAX_VALUE.
+            val v = value ?: fallback
+            return if (v <= 0) Int.MAX_VALUE else v
+        }
+
+        private data class Limits(val playersPerMinute: Int?, val consolePerMinute: Int?)
+
+        private fun tryReadLimits(configPath: Path): Limits? {
+            val loaderOptions = LoaderOptions().apply {
+                isAllowDuplicateKeys = false
+                maxAliasesForCollections = 50
+                nestingDepthLimit = 50
+                codePointLimit = 1_000_000
+            }
+            val yaml = Yaml(SafeConstructor(loaderOptions))
+
+            return try {
+                val rootAny = Files.newInputStream(configPath).use { yaml.load<Any?>(it) }
+                val root = rootAny as? Map<*, *> ?: return null
+
+                val pluginSection = root["plugin"] as? Map<*, *>
+                val rl = pluginSection?.get("ratelimiter") as? Map<*, *>
+
+                val players = (rl?.get("players") as? Number)?.toInt()
+                val console = (rl?.get("console") as? Number)?.toInt()
+
+                Limits(playersPerMinute = players, consolePerMinute = console)
+            } catch (e: Exception) {
+                logger.warn("Failed to read plugin.ratelimiter from config.yml (keeping previous limiter): {}", e.message)
+                null
+            }
+        }
     }
 
     // -------------------- tiny rate limiter --------------------
@@ -443,6 +591,12 @@ class CommandHandler(
         private val windows = ConcurrentHashMap<String, ConcurrentLinkedQueue<Long>>()
 
         fun tryAcquire(key: String): Boolean {
+            val limit = if (key == "CONSOLE") consoleMaxPerMinute else playerMaxPerMinute
+            if (limit == Int.MAX_VALUE) {
+                windows.remove(key)
+                return true
+            }
+
             val now = System.currentTimeMillis()
             val window = windows.computeIfAbsent(key) { ConcurrentLinkedQueue() }
 
@@ -451,13 +605,21 @@ class CommandHandler(
                 if (now - head > 60_000) window.poll() else break
             }
 
-            val limit = if (key == "CONSOLE") consoleMaxPerMinute else playerMaxPerMinute
-            return if (window.size < limit) {
+            val allowed = if (window.size < limit) {
                 window.offer(now)
-                true
             } else {
                 false
             }
+
+            if (window.isEmpty()) {
+                windows.remove(key, window)
+            }
+
+            return allowed
+        }
+
+        fun snapshotLimits(): Pair<Int, Int> {
+            return playerMaxPerMinute to consoleMaxPerMinute
         }
     }
 }
