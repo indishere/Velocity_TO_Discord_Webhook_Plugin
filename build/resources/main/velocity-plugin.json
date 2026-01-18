@@ -1,0 +1,9 @@
+{
+  "id": "velocity_to_discord_webhook_plugin",
+  "name": "Velocity TO Discord Webhook Plugin",
+  "version": "67KB.v0.2-BETA-SOURCE",
+  "description": "This is THE ONLY Velocity Plugin that allows you to ONLY have webhooks sent to discord. This DOES NOT require ANY discord bots to function. MORE in the README.",
+  "url": "https://github.com/indishere/Velocity_TO_Discord_Weekhook_Plugin",
+  "authors": ["IND_is_Here"],
+  "main": "com.indishere.velocity_to_discord_webhook_plugin.InitHQ"
+}

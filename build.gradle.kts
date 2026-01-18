@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "com.indishere"
-version = "67KB.v0.1-STABLE"
+version = "67KB.v0.2-BETA-SOURCE"
 
 kotlin {
     jvmToolchain(17)
